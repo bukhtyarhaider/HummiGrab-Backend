@@ -66,7 +66,7 @@ def generate_openai_summary(transcript: str) -> Dict[str, str]:
         
     Returns:
         Dict[str, str]: A dictionary containing:
-            - 'summary': A concise summary in well-formatted Markdown.
+            - 'summary': A detailed, structured, and objective summary in well-formatted Markdown.
             - 'transcript': The original transcript (returned as-is for frontend display).
             
     Raises:
@@ -74,8 +74,8 @@ def generate_openai_summary(transcript: str) -> Dict[str, str]:
         
     The summary will be formatted with:
     - A main heading (# Summary)
-    - Bullet points (- ) for key points
-    - Bold text (**text**) for emphasis where appropriate
+    - Bullet points for key points, main arguments, and supporting evidence
+    - Direct quotes from the transcript where relevant
     - Proper spacing and structure for readability
     """
     try:
@@ -85,10 +85,14 @@ def generate_openai_summary(transcript: str) -> Dict[str, str]:
                 {
                     "role": "system",
                     "content": (
-                        "You are a helpful assistant that summarizes video transcripts. "
-                        "Provide responses in well-formatted Markdown with a '# Summary' heading "
-                        "followed by concise bullet points using '-'. Use bold (**text**) for emphasis "
-                        "where appropriate. Keep it clear and structured."
+                        "You are a research assistant that provides detailed, structured, and objective summaries of video transcripts. "
+                        "Your summaries should be in well-formatted Markdown and include:\n"
+                        "- A small intoduction'\n"
+                        "- Bullet points for key points, main arguments, and supporting evidence\n"
+                        "- followed by concise bullet points using '-'. Use bold (**text**) for emphasis\n"
+                        "- Direct quotes from the transcript where relevant, to support the summary points\n"
+                        "- Proper spacing and structure for readability\n"
+                        "Ensure that the summary is comprehensive, accurate, and captures the essence of the video content without introducing bias, suitable for research purposes."
                     )
                 },
                 {
@@ -96,7 +100,7 @@ def generate_openai_summary(transcript: str) -> Dict[str, str]:
                     "content": f"Please summarize this video transcript:\n\n{transcript}"
                 }
             ],
-            max_tokens=500,
+            max_tokens=600,
             temperature=0.7  # Added for controlled creativity
         )
         
@@ -149,9 +153,9 @@ def generate_summary():
         logger.info("Generating summary with OpenAI")
         try:
             response = generate_openai_summary(transcript)
-            summary = response.choices[0].message.content
-        except APIError as e:
-            if e.response.status_code == 429:
+            summary = response['summary']  # Access summary from the dictionary
+        except OpenAIError as e:  # Correct exception name
+            if getattr(e.response, 'status_code', None) == 429:
                 logger.error("OpenAI quota exceeded or rate limit hit after retries")
                 return jsonify({'error': 'OpenAI quota exceeded. Please check your plan or try again later.'}), 429
             raise  # Re-raise other errors
@@ -164,7 +168,7 @@ def generate_summary():
         return jsonify({
             'summary': summary,
             'download_id': download_id,
-            'transcript':transcript,
+            'transcript': transcript,
         })
         
     except Exception as e:

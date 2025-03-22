@@ -1,4 +1,5 @@
 import os
+from typing import Dict
 import uuid
 import threading
 import logging
@@ -7,6 +8,10 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import yt_dlp
 from dotenv import load_dotenv
+from openai import OpenAI, OpenAIError
+import time
+import whisper
+import backoff
 
 # Load environment variables
 load_dotenv()
@@ -22,6 +27,10 @@ logger = logging.getLogger(__name__)
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": os.getenv("ALLOWED_ORIGINS", "*")}})
+
+# Initialize OpenAI and Whisper
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+whisper_model = whisper.load_model("base")  # Use 'base' for speed, 'large' for better accuracy
 
 # Configuration
 app.config['DOWNLOAD_FOLDER'] = os.getenv('DOWNLOAD_FOLDER', os.path.join(os.getcwd(), 'downloads'))
@@ -41,6 +50,126 @@ def add_cors_headers(response):
 @app.route('/')
 def index():
     return jsonify({"message": "Backend is running, React frontend should handle routing."})
+
+@backoff.on_exception(
+    backoff.expo,
+    OpenAIError, 
+    max_tries=5,
+    giveup=lambda e: getattr(e.response, 'status_code', None) != 429  # Safely handle cases where response might not exist
+)
+def generate_openai_summary(transcript: str) -> Dict[str, str]:
+    """
+    Generate a well-formatted Markdown summary from a video transcript using OpenAI's GPT-4o-mini model.
+    
+    Args:
+        transcript (str): The video transcript to summarize.
+        
+    Returns:
+        Dict[str, str]: A dictionary containing:
+            - 'summary': A concise summary in well-formatted Markdown.
+            - 'transcript': The original transcript (returned as-is for frontend display).
+            
+    Raises:
+        OpenAIError: If the API call fails after max retries, excluding rate limit errors (429).
+        
+    The summary will be formatted with:
+    - A main heading (# Summary)
+    - Bullet points (- ) for key points
+    - Bold text (**text**) for emphasis where appropriate
+    - Proper spacing and structure for readability
+    """
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helpful assistant that summarizes video transcripts. "
+                        "Provide responses in well-formatted Markdown with a '# Summary' heading "
+                        "followed by concise bullet points using '-'. Use bold (**text**) for emphasis "
+                        "where appropriate. Keep it clear and structured."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Please summarize this video transcript:\n\n{transcript}"
+                }
+            ],
+            max_tokens=500,
+            temperature=0.7  # Added for controlled creativity
+        )
+        
+        # Extract the summary from the response
+        summary_content = response.choices[0].message.content.strip()
+        
+        # Ensure the response starts with a heading if not already present
+        if not summary_content.startswith("# "):
+            summary_content = "# Summary\n\n" + summary_content
+        
+        return {
+            "summary": summary_content,
+            "transcript": transcript  # Return original transcript as-is
+        }
+    
+    except AttributeError as e:
+        # Handle cases where response structure is unexpected
+        raise OpenAIError(f"Unexpected response format from OpenAI API: {str(e)}")
+
+@app.route('/generate_summary', methods=['POST'])
+def generate_summary():
+    data = request.get_json() or {}
+    download_id = data.get('download_id')
+    
+    logger.info(f"Received summary request with data: {data}")
+    logger.info(f"download_id: {download_id}")
+    logger.info(f"Current download_tasks: {download_tasks}")
+    
+    if not download_id or download_id not in download_tasks:
+        logger.error(f"Invalid download_id: {download_id} not found in download_tasks")
+        return jsonify({'error': 'Invalid download_id'}), 400
+    
+    task = download_tasks[download_id]
+    logger.info(f"Task details: {task}")
+    
+    if task.get('status') != 'completed' or not task.get('filename'):
+        logger.warning(f"Task not ready: status={task.get('status')}, filename={task.get('filename')}")
+        return jsonify({'error': 'Video not downloaded yet'}), 400
+    
+    video_path = task['filename']
+    
+    try:
+        # Generate transcript using Whisper
+        logger.info(f"Transcribing video: {video_path}")
+        result = whisper_model.transcribe(video_path)
+        transcript = result["text"]
+        logger.info(f"Transcription completed: {transcript[:100]}...")
+        
+        # Generate summary using OpenAI with retry logic
+        logger.info("Generating summary with OpenAI")
+        try:
+            response = generate_openai_summary(transcript)
+            summary = response.choices[0].message.content
+        except APIError as e:
+            if e.response.status_code == 429:
+                logger.error("OpenAI quota exceeded or rate limit hit after retries")
+                return jsonify({'error': 'OpenAI quota exceeded. Please check your plan or try again later.'}), 429
+            raise  # Re-raise other errors
+        
+        logger.info(f"Summary generated: {summary[:50]}...")
+        
+        # Store summary with download task
+        download_tasks[download_id]['summary'] = summary
+        
+        return jsonify({
+            'summary': summary,
+            'download_id': download_id,
+            'transcript':transcript,
+        })
+        
+    except Exception as e:
+        logger.error(f"Error generating summary for {download_id}: {str(e)}")
+        return jsonify({'error': f'Failed to generate summary: {str(e)}'}), 500
 
 @app.route('/get_info', methods=['POST'])
 def get_info():
@@ -183,13 +312,19 @@ def get_file():
     return send_file(filename, as_attachment=True, download_name=secure_filename(os.path.basename(filename)))
 
 def cleanup_downloads():
-    """Clean up old download files periodically."""
     for download_id, task in list(download_tasks.items()):
         if task.get('status') in ['completed', 'error'] and 'filename' in task:
             if os.path.exists(task['filename']) and (time.time() - os.path.getmtime(task['filename']) > 24 * 3600):
                 os.remove(task['filename'])
+                download_tasks[download_id] = {
+                    'status': task['status'],
+                    'summary': task.get('summary'),
+                    'progress': task.get('progress', 100 if task['status'] == 'completed' else 0)
+                }
+                logger.info(f"Cleaned up file for {download_id}, keeping task data")
+            elif not task.get('summary') and not os.path.exists(task['filename']):
                 del download_tasks[download_id]
-                logger.info(f"Cleaned up old download {download_id}")
+                logger.info(f"Removed empty task {download_id}")
 
 if __name__ == "__main__":
     #Use waitress or gunicorn for production instead of Flask's dev server

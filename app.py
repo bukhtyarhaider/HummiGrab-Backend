@@ -12,6 +12,11 @@ from openai import OpenAI, OpenAIError
 import time
 import whisper
 import backoff
+import datetime
+
+# New imports for database caching
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 # Load environment variables
 load_dotenv()
@@ -30,13 +35,33 @@ CORS(app, resources={r"/*": {"origins": os.getenv("ALLOWED_ORIGINS", "*")}})
 
 # Initialize OpenAI and Whisper
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-whisper_model = whisper.load_model("base")  # Use 'base' for speed, 'large' for better accuracy
+whisper_model = whisper.load_model("base")  # 'base' for speed; consider 'large' for improved accuracy
+
+# Database setup (SQLite via SQLAlchemy)
+DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///video_records.db')
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+class VideoRecord(Base):
+    __tablename__ = 'video_records'
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(String, unique=True, index=True)  # New unique identifier
+    url = Column(String)  # Still store the URL if needed
+    title = Column(String)
+    transcript = Column(Text)
+    summary = Column(Text)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+Base.metadata.create_all(bind=engine)
 
 # Configuration
 app.config['DOWNLOAD_FOLDER'] = os.getenv('DOWNLOAD_FOLDER', os.path.join(os.getcwd(), 'downloads'))
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB limit for request size
 os.makedirs(app.config['DOWNLOAD_FOLDER'], exist_ok=True)
 
+# In-memory download tracking (each download task is stored here)
 download_tasks = {}
 
 @app.after_request
@@ -46,38 +71,62 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return response
 
-# Routes
 @app.route('/')
 def index():
     return jsonify({"message": "Backend is running, React frontend should handle routing."})
+
+# Updated /get_info endpoint returns video_id
+@app.route('/get_info', methods=['POST'])
+def get_info():
+    data = request.get_json() or {}
+    url = data.get('url')
+    if not url:
+        return jsonify({'error': 'No URL provided'}), 400
+
+    ydl_opts = {
+        'quiet': True,
+        'skip_download': True,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        logger.error(f"Error fetching info for URL {url}: {str(e)}")
+        return jsonify({'error': 'Failed to fetch video info'}), 500
+
+    video_id = info.get('id')  # Extract video ID from info
+    title = info.get('title')
+    thumbnail = info.get('thumbnail')
+    duration = info.get('duration')
+    video_formats = []
+    for f in info.get('formats', []):
+        if f.get('vcodec') != 'none' and f.get('acodec') == 'none':
+            filesize_bytes = f.get('filesize') or f.get('filesize_approx')
+            size_str = f" (~{filesize_bytes / 1048576:.2f} MB)" if filesize_bytes else ""
+            resolution = f.get('height')
+            resolution = f"{resolution}p" if resolution else f.get('format_note', '')
+            label = f"{resolution} - {f.get('ext').upper()}{size_str}"
+            video_formats.append({
+                'format_id': f.get('format_id'),
+                'label': label
+            })
+
+    return jsonify({
+        'video_id': video_id,  # Return video id
+        'title': title,
+        'thumbnail': thumbnail,
+        'duration': duration,
+        'video_formats': video_formats
+    })
 
 @backoff.on_exception(
     backoff.expo,
     OpenAIError, 
     max_tries=5,
-    giveup=lambda e: getattr(e.response, 'status_code', None) != 429  # Safely handle cases where response might not exist
+    giveup=lambda e: getattr(e.response, 'status_code', None) != 429
 )
 def generate_openai_summary(transcript: str) -> Dict[str, str]:
-    """
-    Generate a well-formatted Markdown summary from a video transcript using OpenAI's GPT-4o-mini model.
-    
-    Args:
-        transcript (str): The video transcript to summarize.
-        
-    Returns:
-        Dict[str, str]: A dictionary containing:
-            - 'summary': A detailed, structured, and objective summary in well-formatted Markdown.
-            - 'transcript': The original transcript (returned as-is for frontend display).
-            
-    Raises:
-        OpenAIError: If the API call fails after max retries, excluding rate limit errors (429).
-        
-    The summary will be formatted with:
-    - A main heading (# Summary)
-    - Bullet points for key points, main arguments, and supporting evidence
-    - Direct quotes from the transcript where relevant
-    - Proper spacing and structure for readability
-    """
     try:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -101,23 +150,16 @@ def generate_openai_summary(transcript: str) -> Dict[str, str]:
                 }
             ],
             max_tokens=600,
-            temperature=0.7  # Added for controlled creativity
+            temperature=0.7
         )
-        
-        # Extract the summary from the response
         summary_content = response.choices[0].message.content.strip()
-        
-        # Ensure the response starts with a heading if not already present
         if not summary_content.startswith("# "):
             summary_content = "# Summary\n\n" + summary_content
-        
         return {
             "summary": summary_content,
-            "transcript": transcript  # Return original transcript as-is
+            "transcript": transcript
         }
-    
     except AttributeError as e:
-        # Handle cases where response structure is unexpected
         raise OpenAIError(f"Unexpected response format from OpenAI API: {str(e)}")
 
 @app.route('/generate_summary', methods=['POST'])
@@ -126,9 +168,6 @@ def generate_summary():
     download_id = data.get('download_id')
     
     logger.info(f"Received summary request with data: {data}")
-    logger.info(f"download_id: {download_id}")
-    logger.info(f"Current download_tasks: {download_tasks}")
-    
     if not download_id or download_id not in download_tasks:
         logger.error(f"Invalid download_id: {download_id} not found in download_tasks")
         return jsonify({'error': 'Invalid download_id'}), 400
@@ -141,81 +180,61 @@ def generate_summary():
         return jsonify({'error': 'Video not downloaded yet'}), 400
     
     video_path = task['filename']
+    video_id = task.get('video_id')
     
-    try:
-        # Generate transcript using Whisper
+    session = SessionLocal()
+    video_record = session.query(VideoRecord).filter(VideoRecord.video_id == video_id).first()
+    
+    # If transcript already exists, reuse it (and summary if available)
+    if video_record and video_record.transcript:
+        transcript = video_record.transcript
+        if video_record.summary:
+            summary_text = video_record.summary
+            session.close()
+            download_tasks[download_id]['summary'] = summary_text
+            return jsonify({
+                'summary': summary_text,
+                'download_id': download_id,
+                'transcript': transcript,
+            })
+    else:
+        # Transcribe the video if no cached transcript exists
         logger.info(f"Transcribing video: {video_path}")
         result = whisper_model.transcribe(video_path)
         transcript = result["text"]
         logger.info(f"Transcription completed: {transcript[:100]}...")
-        
-        # Generate summary using OpenAI with retry logic
-        logger.info("Generating summary with OpenAI")
-        try:
-            response = generate_openai_summary(transcript)
-            summary = response['summary']  # Access summary from the dictionary
-        except OpenAIError as e:  # Correct exception name
-            if getattr(e.response, 'status_code', None) == 429:
-                logger.error("OpenAI quota exceeded or rate limit hit after retries")
-                return jsonify({'error': 'OpenAI quota exceeded. Please check your plan or try again later.'}), 429
-            raise  # Re-raise other errors
-        
-        logger.info(f"Summary generated: {summary[:50]}...")
-        
-        # Store summary with download task
-        download_tasks[download_id]['summary'] = summary
-        
-        return jsonify({
-            'summary': summary,
-            'download_id': download_id,
-            'transcript': transcript,
-        })
-        
-    except Exception as e:
-        logger.error(f"Error generating summary for {download_id}: {str(e)}")
-        return jsonify({'error': f'Failed to generate summary: {str(e)}'}), 500
-
-@app.route('/get_info', methods=['POST'])
-def get_info():
-    data = request.get_json() or {}
-    url = data.get('url')
-    if not url:
-        return jsonify({'error': 'No URL provided'}), 400
-
-    ydl_opts = {
-        'quiet': True,
-        'skip_download': True,
-    }
-
+        if video_record is None:
+            video_record = VideoRecord(
+                video_id=video_id,
+                title=task.get('title', ''),
+                url=task.get('url'),
+                transcript=transcript
+            )
+            session.add(video_record)
+        else:
+            video_record.transcript = transcript
+        session.commit()
+    
+    logger.info("Generating summary with OpenAI")
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        logger.error(f"Error fetching info for URL {url}: {str(e)}")
-        return jsonify({'error': 'Failed to fetch video info'}), 500
-
-    title = info.get('title')
-    thumbnail = info.get('thumbnail')
-    duration = info.get('duration')
-
-    video_formats = []
-    for f in info.get('formats', []):
-        if f.get('vcodec') != 'none' and f.get('acodec') == 'none':
-            filesize_bytes = f.get('filesize') or f.get('filesize_approx')
-            size_str = f" (~{filesize_bytes / 1048576:.2f} MB)" if filesize_bytes else ""
-            resolution = f.get('height')
-            resolution = f"{resolution}p" if resolution else f.get('format_note', '')
-            label = f"{resolution} - {f.get('ext').upper()}{size_str}"
-            video_formats.append({
-                'format_id': f.get('format_id'),
-                'label': label
-            })
-
+        response = generate_openai_summary(transcript)
+        summary_text = response['summary']
+        video_record.summary = summary_text
+        session.commit()
+    except OpenAIError as e:
+        if getattr(e.response, 'status_code', None) == 429:
+            logger.error("OpenAI quota exceeded or rate limit hit after retries")
+            session.close()
+            return jsonify({'error': 'OpenAI quota exceeded. Please check your plan or try again later.'}), 429
+        session.close()
+        raise
+    
+    session.close()
+    download_tasks[download_id]['summary'] = summary_text
     return jsonify({
-        'title': title,
-        'thumbnail': thumbnail,
-        'duration': duration,
-        'video_formats': video_formats
+        'summary': summary_text,
+        'download_id': download_id,
+        'transcript': transcript,
     })
 
 def download_progress_hook(download_id):
@@ -264,11 +283,17 @@ def start_download():
     data = request.get_json() or {}
     url = data.get('url')
     video_format_id = data.get('video_format_id')
-    if not url or not video_format_id:
-        return jsonify({'error': 'URL and video_format_id are required'}), 400
+    video_id = data.get('video_id')  # Expect video_id from the frontend
+    title = data.get('title')        # Optional title field
+    if not url or not video_format_id or not video_id:
+        return jsonify({'error': 'URL, video_format_id, and video_id are required'}), 400
 
     download_id = uuid.uuid4().hex
+    # Store the video URL and video_id in the download task for later lookup in the DB
     download_tasks[download_id] = {
+        'url': url,
+        'video_id': video_id,
+        'title': title,
         'progress': 0,
         'status': 'downloading',
         'filename': None,
@@ -277,7 +302,7 @@ def start_download():
 
     thread = threading.Thread(target=download_video_task, args=(download_id, url, video_format_id))
     thread.start()
-    logger.info(f"Started download task {download_id} for URL {url}")
+    logger.info(f"Started download task {download_id} for video_id {video_id} and URL {url}")
     return jsonify({'download_id': download_id})
 
 @app.route('/progress', methods=['GET'])
@@ -331,9 +356,8 @@ def cleanup_downloads():
                 logger.info(f"Removed empty task {download_id}")
 
 if __name__ == "__main__":
-    #Use waitress or gunicorn for production instead of Flask's dev server
+    # Use waitress or gunicorn for production instead of Flask's dev server
     from waitress import serve
     port = int(os.getenv('PORT', 5000))
     logger.info(f"Starting server on port {port}")
     serve(app, host='0.0.0.0', port=port)
-    # app.run(debug=True)

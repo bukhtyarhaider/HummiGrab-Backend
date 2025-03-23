@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Dict
 import uuid
 import threading
@@ -165,59 +166,109 @@ def generate_openai_summary(transcript: str) -> Dict[str, str]:
         }
     except AttributeError as e:
         raise OpenAIError(f"Unexpected response format from OpenAI API: {str(e)}")
+    
+@app.route('/generate_transcript', methods=['POST'])
+def generate_transcript():
+    data = request.get_json() or {}
+    url = data.get('url')
+    if not url:
+        logger.error("No URL provided for transcript generation")
+        return jsonify({'error': 'URL must be provided'}), 400
+
+    # Extract video ID from the URL using a regex
+    pattern = r'(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})'
+    match = re.search(pattern, url)
+    if not match:
+        logger.error("Invalid YouTube URL")
+        return jsonify({'error': 'Invalid YouTube URL'}), 400
+    video_id = match.group(1)
+    logger.info(f"Extracted video_id: {video_id} from URL: {url}")
+
+    # Check if a transcript already exists in the database for this video
+    session = SessionLocal()
+    video_record = session.query(VideoRecord).filter(VideoRecord.video_id == video_id).first()
+    if video_record and video_record.transcript:
+        transcript = video_record.transcript
+        session.close()
+        return jsonify({'transcript': transcript, 'video_id': video_id})
+
+    # If no transcript exists, download the lowest-quality audio temporarily
+    temp_id = uuid.uuid4().hex
+    temp_file_template = os.path.join(app.config['DOWNLOAD_FOLDER'], f"temp_{temp_id}.%(ext)s")
+    ydl_opts = {
+        'outtmpl': temp_file_template,
+        'noplaylist': True,
+        'format': 'worstaudio',
+        'quiet': True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            temp_file = ydl.prepare_filename(info)
+            logger.info(f"Temporary audio downloaded: {temp_file}")
+    except Exception as e:
+        logger.error(f"Audio download failed: {str(e)}")
+        session.close()
+        return jsonify({'error': 'Audio download failed: ' + str(e)}), 500
+
+    # Transcribe the downloaded audio using Whisper
+    logger.info(f"Transcribing audio for video_id {video_id}")
+    try:
+        result = whisper_model.transcribe(temp_file)
+    except Exception as e:
+        logger.error(f"Transcription failed: {str(e)}")
+        session.close()
+        return jsonify({'error': 'Transcription failed: ' + str(e)}), 500
+    transcript = result["text"]
+    logger.info(f"Transcription completed for video_id {video_id}")
+
+    # Store the transcript in the database
+    if video_record is None:
+        video_record = VideoRecord(
+            video_id=video_id,
+            title=info.get('title', ''),
+            url=url,
+            transcript=transcript
+        )
+        session.add(video_record)
+    else:
+        video_record.transcript = transcript
+    session.commit()
+    session.close()
+
+    # Clean up the temporary audio file
+    try:
+        os.remove(temp_file)
+        logger.info(f"Temporary file {temp_file} removed.")
+    except Exception as e:
+        logger.warning(f"Failed to remove temporary file {temp_file}: {str(e)}")
+
+    return jsonify({'transcript': transcript, 'video_id': video_id})
 
 @app.route('/generate_summary', methods=['POST'])
 def generate_summary():
     data = request.get_json() or {}
-    download_id = data.get('download_id')
+    video_id = data.get('video_id')
     
     logger.info(f"Received summary request with data: {data}")
-    if not download_id or download_id not in download_tasks:
-        logger.error(f"Invalid download_id: {download_id} not found in download_tasks")
-        return jsonify({'error': 'Invalid download_id'}), 400
-    
-    task = download_tasks[download_id]
-    logger.info(f"Task details: {task}")
-    
-    if task.get('status') != 'completed' or not task.get('filename'):
-        logger.warning(f"Task not ready: status={task.get('status')}, filename={task.get('filename')}")
-        return jsonify({'error': 'Video not downloaded yet'}), 400
-    
-    video_path = task['filename']
-    video_id = task.get('video_id')
     
     session = SessionLocal()
     video_record = session.query(VideoRecord).filter(VideoRecord.video_id == video_id).first()
     
-    # If transcript already exists, reuse it (and summary if available)
-    if video_record and video_record.transcript:
-        transcript = video_record.transcript
-        if video_record.summary:
-            summary_text = video_record.summary
-            session.close()
-            download_tasks[download_id]['summary'] = summary_text
-            return jsonify({
-                'summary': summary_text,
-                'download_id': download_id,
-                'transcript': transcript,
-            })
-    else:
-        # Transcribe the video if no cached transcript exists
-        logger.info(f"Transcribing video: {video_path}")
-        result = whisper_model.transcribe(video_path)
-        transcript = result["text"]
-        logger.info(f"Transcription completed: {transcript[:100]}...")
-        if video_record is None:
-            video_record = VideoRecord(
-                video_id=video_id,
-                title=task.get('title', ''),
-                url=task.get('url'),
-                transcript=transcript
-            )
-            session.add(video_record)
-        else:
-            video_record.transcript = transcript
-        session.commit()
+    # Require transcript to be present first
+    if video_record is None or not video_record.transcript:
+        session.close()
+        logger.error(f"No avaiable Transcript for video_id: {video_id}: Transcript not generated. Please generate transcript first.")
+        return jsonify({'error': 'Transcript not generated. Please generate transcript first.'}), 400
+    
+    transcript = video_record.transcript
+    if video_record.summary:
+        summary_text = video_record.summary
+        session.close()
+        return jsonify({
+            'summary': summary_text,
+            'video_id': video_id,
+        })
     
     logger.info("Generating summary with OpenAI")
     try:
@@ -232,13 +283,11 @@ def generate_summary():
             return jsonify({'error': 'OpenAI quota exceeded. Please check your plan or try again later.'}), 429
         session.close()
         raise
-    
+
     session.close()
-    download_tasks[download_id]['summary'] = summary_text
     return jsonify({
         'summary': summary_text,
-        'download_id': download_id,
-        'transcript': transcript,
+        'video_id': video_id,
     })
 
 def download_progress_hook(download_id):

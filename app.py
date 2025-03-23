@@ -3,7 +3,7 @@ from typing import Dict
 import uuid
 import threading
 import logging
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, render_template
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import yt_dlp
@@ -46,13 +46,17 @@ Base = declarative_base()
 class VideoRecord(Base):
     __tablename__ = 'video_records'
     id = Column(Integer, primary_key=True, index=True)
-    video_id = Column(String, unique=True, index=True)  # New unique identifier
-    url = Column(String)  # Still store the URL if needed
+    video_id = Column(String, unique=True, index=True)  
+    url = Column(String)
     title = Column(String)
     transcript = Column(Text)
     summary = Column(Text)
+    filename = Column(String, nullable=True)
+    video_format = Column(String, nullable=True)   
+    file_size = Column(Integer, nullable=True)       
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -268,6 +272,17 @@ def download_video_task(download_id, url, video_format_id):
             download_tasks[download_id]['filename'] = filename
             download_tasks[download_id]['status'] = 'completed'
             logger.info(f"Download completed for {download_id}: {filename}")
+
+            session = SessionLocal()
+            video_id = download_tasks[download_id].get('video_id')
+            video_record = session.query(VideoRecord).filter(VideoRecord.video_id == video_id).first()
+            if video_record:
+                video_record.filename = filename
+                video_record.video_format = download_tasks[download_id].get('video_format')
+                if os.path.exists(filename):
+                    video_record.file_size = os.path.getsize(filename)
+                session.commit()
+            session.close()
     except Exception as e:
         download_tasks[download_id]['status'] = 'error'
         download_tasks[download_id]['error'] = str(e)
@@ -278,22 +293,24 @@ def download_video_task(download_id, url, video_format_id):
                 os.remove(download_tasks[download_id]['filename'])
             del download_tasks[download_id]
 
+
 @app.route('/start_download', methods=['POST'])
 def start_download():
     data = request.get_json() or {}
     url = data.get('url')
     video_format_id = data.get('video_format_id')
-    video_id = data.get('video_id')  # Expect video_id from the frontend
-    title = data.get('title')        # Optional title field
+    video_format = data.get('video_format')  
+    video_id = data.get('video_id')  
+    title = data.get('title')        
     if not url or not video_format_id or not video_id:
         return jsonify({'error': 'URL, video_format_id, and video_id are required'}), 400
 
     download_id = uuid.uuid4().hex
-    # Store the video URL and video_id in the download task for later lookup in the DB
     download_tasks[download_id] = {
         'url': url,
         'video_id': video_id,
         'title': title,
+        'video_format': video_format,
         'progress': 0,
         'status': 'downloading',
         'filename': None,
@@ -304,6 +321,7 @@ def start_download():
     thread.start()
     logger.info(f"Started download task {download_id} for video_id {video_id} and URL {url}")
     return jsonify({'download_id': download_id})
+
 
 @app.route('/progress', methods=['GET'])
 def progress():
@@ -354,6 +372,52 @@ def cleanup_downloads():
             elif not task.get('summary') and not os.path.exists(task['filename']):
                 del download_tasks[download_id]
                 logger.info(f"Removed empty task {download_id}")
+
+# ============== Admin Dashboard Routes ==============
+
+@app.route('/admin/dashboard')
+def admin_dashboard():
+    session = SessionLocal()
+    records = session.query(VideoRecord).all()
+    session.close()
+    return render_template('admin_dashboard.html', records=records)
+
+@app.route('/admin/delete_record/<int:record_id>', methods=['POST'])
+def admin_delete_record(record_id):
+    session = SessionLocal()
+    record = session.query(VideoRecord).filter(VideoRecord.id == record_id).first()
+    if not record:
+        session.close()
+        return jsonify({'error': 'Record not found'}), 404
+    session.delete(record)
+    session.commit()
+    session.close()
+    return jsonify({'message': 'Record deleted successfully'})
+
+@app.route('/admin/delete_file/<int:record_id>', methods=['POST'])
+def admin_delete_file(record_id):
+    session = SessionLocal()
+    record = session.query(VideoRecord).filter(VideoRecord.id == record_id).first()
+    if not record:
+        session.close()
+        return jsonify({'error': 'Record not found'}), 404
+    if record.filename and os.path.exists(record.filename):
+        try:
+            os.remove(record.filename)
+        except Exception as e:
+            session.close()
+            return jsonify({'error': 'Error deleting file: ' + str(e)}), 500
+        record.filename = None
+        record.file_size = None  
+        session.commit()
+        session.close()
+        return jsonify({'message': 'Cached file deleted successfully'})
+    else:
+        session.close()
+        return jsonify({'error': 'No cached file found'}), 404
+
+
+# ====================================================
 
 if __name__ == "__main__":
     # Use waitress or gunicorn for production instead of Flask's dev server

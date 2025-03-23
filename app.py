@@ -39,7 +39,7 @@ openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 whisper_model = whisper.load_model("base")  # 'base' for speed; consider 'large' for improved accuracy
 
 # Database setup (SQLite via SQLAlchemy)
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///video_records.db')
+DATABASE_URL = os.getenv('DATABASE_URL')
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()

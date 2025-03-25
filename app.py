@@ -14,6 +14,7 @@ import time
 import whisper
 import backoff
 import datetime
+from textblob import TextBlob
 
 # New imports for database caching
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
@@ -80,6 +81,248 @@ def add_cors_headers(response):
 @app.route('/')
 def index():
     return jsonify({"message": "Backend is running, React frontend should handle routing."})
+
+@app.route('/get_comments', methods=['POST'])
+def get_comments():
+    data = request.get_json() or {}
+    url = data.get('url')
+    if not url:
+        logger.error("No URL provided for comments fetching")
+        return jsonify({'error': 'URL must be provided'}), 400
+
+    # Extract video ID from the URL
+    pattern = r'(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})'
+    match = re.search(pattern, url)
+    if not match:
+        logger.error("Invalid YouTube URL")
+        return jsonify({'error': 'Invalid YouTube URL'}), 400
+    video_id = match.group(1)
+    logger.info(f"Extracted video_id: {video_id} from URL: {url}")
+
+    # Check if comments already exist in the database
+    session = SessionLocal()
+    video_record = session.query(VideoRecord).filter(VideoRecord.video_id == video_id).first()
+    if video_record and video_record.comments:
+        import json
+        comments = json.loads(video_record.comments)
+        # Fetch total comment count from metadata if available, otherwise use length of cached comments
+        ydl_opts = {'quiet': True, 'skip_download': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            total_comments = info.get('comment_count', len(comments))
+        session.close()
+        return jsonify({
+            'comments': comments,
+            'total_comments': total_comments,
+            'video_id': video_id
+        })
+
+    # Fetch comments and total count using yt_dlp
+    ydl_opts = {
+        'quiet': True,
+        'skip_download': True,
+        'getcomments': True,  # Enable comment extraction
+        'extract_flat': True,  # Faster extraction without full video info
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            comments = info.get('comments', [])
+            total_comments = info.get('comment_count', len(comments))  # Fallback to fetched count if not available
+            if not comments:
+                logger.info(f"No comments found for video_id: {video_id}")
+            else:
+                logger.info(f"Fetched {len(comments)} comments out of {total_comments} for video_id: {video_id}")
+    except Exception as e:
+        logger.error(f"Error fetching comments for URL {url}: {str(e)}")
+        session.close()
+        return jsonify({'error': 'Failed to fetch comments: ' + str(e)}), 500
+
+    # Format comments for response and storage
+    formatted_comments = []
+    for comment in comments:
+        formatted_comments.append({
+            'id': comment.get('id'),
+            'text': comment.get('text'),
+            'author': comment.get('author'),
+            'author_id': comment.get('author_id'),
+            'timestamp': comment.get('timestamp'),
+            'like_count': comment.get('like_count', 0),
+            'is_reply': bool(comment.get('parent') != 'root'),
+            'parent_id': comment.get('parent')
+        })
+
+    # Store comments in the database as JSON string
+    import json
+    if video_record is None:
+        video_record = VideoRecord(
+            video_id=video_id,
+            url=url,
+            title=info.get('title', ''),
+            comments=json.dumps(formatted_comments)
+        )
+        session.add(video_record)
+    else:
+        video_record.comments = json.dumps(formatted_comments)
+    session.commit()
+    session.close()
+
+    return jsonify({
+        'comments': formatted_comments,
+        'total_comments': total_comments,
+        'video_id': video_id
+    })
+
+@app.route('/analyze_sentiment', methods=['POST'])
+def analyze_sentiment():
+    data = request.get_json() or {}
+    url = data.get('url')
+    if not url:
+        logger.error("No URL provided for sentiment analysis")
+        return jsonify({'error': 'URL must be provided'}), 400
+
+    # Extract video ID from the URL
+    pattern = r'(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})'
+    match = re.search(pattern, url)
+    if not match:
+        logger.error("Invalid YouTube URL")
+        return jsonify({'error': 'Invalid YouTube URL'}), 400
+    video_id = match.group(1)
+    logger.info(f"Starting sentiment analysis for video_id: {video_id} from URL: {url}")
+
+    # Check if comments exist in the database
+    session = SessionLocal()
+    video_record = session.query(VideoRecord).filter(VideoRecord.video_id == video_id).first()
+    
+    if not video_record or not video_record.comments:
+        # If no comments, fetch them first (reusing get_comments logic)
+        logger.info(f"No comments found for video_id: {video_id}, fetching comments")
+        ydl_opts = {
+            'quiet': True,
+            'skip_download': True,
+            'getcomments': True,
+            'extract_flat': True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                comments = info.get('comments', [])
+                total_comments = info.get('comment_count', len(comments))
+                if not comments:
+                    logger.info(f"No comments available for video_id: {video_id}")
+                    session.close()
+                    return jsonify({
+                        'error': 'No comments available for sentiment analysis',
+                        'video_id': video_id
+                    }), 404
+        except Exception as e:
+            logger.error(f"Error fetching comments for sentiment analysis: {str(e)}")
+            session.close()
+            return jsonify({'error': 'Failed to fetch comments: ' + str(e)}), 500
+
+        # Format and store comments
+        formatted_comments = []
+        for comment in comments:
+            formatted_comments.append({
+                'id': comment.get('id'),
+                'text': comment.get('text'),
+                'author': comment.get('author'),
+                'author_id': comment.get('author_id'),
+                'timestamp': comment.get('timestamp'),
+                'like_count': comment.get('like_count', 0),
+                'is_reply': bool(comment.get('parent') != 'root'),
+                'parent_id': comment.get('parent')
+            })
+        
+        import json
+        if video_record is None:
+            video_record = VideoRecord(
+                video_id=video_id,
+                url=url,
+                title=info.get('title', ''),
+                comments=json.dumps(formatted_comments)
+            )
+            session.add(video_record)
+        else:
+            video_record.comments = json.dumps(formatted_comments)
+        session.commit()
+    else:
+        # Use cached comments
+        import json
+        formatted_comments = json.loads(video_record.comments)
+        # Fetch total comments for consistency
+        ydl_opts = {'quiet': True, 'skip_download': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            total_comments = info.get('comment_count', len(formatted_comments))
+
+    session.close()
+
+    # Perform sentiment analysis
+    sentiment_results = []
+    positive_count = 0
+    negative_count = 0
+    neutral_count = 0
+
+    for comment in formatted_comments:
+        text = comment.get('text', '')
+        if not text:
+            continue
+        blob = TextBlob(text)
+        polarity = blob.sentiment.polarity  # Ranges from -1 (negative) to 1 (positive)
+        
+        # Classify sentiment
+        if polarity > 0.1:
+            sentiment = 'positive'
+            positive_count += 1
+        elif polarity < -0.1:
+            sentiment = 'negative'
+            negative_count += 1
+        else:
+            sentiment = 'neutral'
+            neutral_count += 1
+        
+        sentiment_results.append({
+            'id': comment['id'],
+            'text': text,
+            'sentiment': sentiment,
+            'polarity': polarity
+        })
+
+    total_analyzed = positive_count + negative_count + neutral_count
+    if total_analyzed == 0:
+        logger.info(f"No valid comments to analyze for video_id: {video_id}")
+        return jsonify({
+            'error': 'No valid comments to analyze',
+            'video_id': video_id
+        }), 404
+
+    # Calculate percentages
+    sentiment_summary = {
+        'positive': {
+            'count': positive_count,
+            'percentage': (positive_count / total_analyzed * 100) if total_analyzed > 0 else 0
+        },
+        'negative': {
+            'count': negative_count,
+            'percentage': (negative_count / total_analyzed * 100) if total_analyzed > 0 else 0
+        },
+        'neutral': {
+            'count': neutral_count,
+            'percentage': (neutral_count / total_analyzed * 100) if total_analyzed > 0 else 0
+        },
+        'total_analyzed': total_analyzed,
+        'total_comments': total_comments
+    }
+
+    logger.info(f"Sentiment analysis completed for video_id: {video_id} - Positive: {positive_count}, Negative: {negative_count}, Neutral: {neutral_count}")
+
+    return jsonify({
+        'video_id': video_id,
+        'sentiment_results': sentiment_results,
+        'sentiment_summary': sentiment_summary
+    })
 
 # Updated /get_info endpoint returns video_id
 @app.route('/get_info', methods=['POST'])
@@ -429,6 +672,11 @@ def cleanup_downloads():
 def admin_dashboard():
     session = SessionLocal()
     records = session.query(VideoRecord).all()
+    # Convert comments JSON to Python objects for template
+    for record in records:
+        if record.comments:
+            import json
+            record.comments = json.loads(record.comments)
     session.close()
     return render_template('admin_dashboard.html', records=records)
 
@@ -465,8 +713,7 @@ def admin_delete_file(record_id):
     else:
         session.close()
         return jsonify({'error': 'No cached file found'}), 404
-
-
+    
 # ====================================================
 
 if __name__ == "__main__":

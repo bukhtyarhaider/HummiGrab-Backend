@@ -196,57 +196,15 @@ def analyze_sentiment():
     video_record = session.query(VideoRecord).filter(VideoRecord.video_id == video_id).first()
     
     if not video_record or not video_record.comments:
-        # If no comments, fetch them first (reusing get_comments logic)
-        logger.info(f"No comments found for video_id: {video_id}, fetching comments")
-        ydl_opts = {
-            'quiet': True,
-            'skip_download': True,
-            'getcomments': True,
-            'extract_flat': True,
-        }
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                comments = info.get('comments', [])
-                total_comments = info.get('comment_count', len(comments))
-                if not comments:
-                    logger.info(f"No comments available for video_id: {video_id}")
-                    session.close()
-                    return jsonify({
-                        'error': 'No comments available for sentiment analysis',
-                        'video_id': video_id
-                    }), 404
-        except Exception as e:
-            logger.error(f"Error fetching comments for sentiment analysis: {str(e)}")
+        logger.info(f"No comments found for video_id: {video_id}, calling get_comments")
+        # Call get_comments to fetch and store comments
+        get_comments_response = get_comments()  # This reuses the existing request context
+        if get_comments_response.status_code != 200:
             session.close()
-            return jsonify({'error': 'Failed to fetch comments: ' + str(e)}), 500
-
-        # Format and store comments
-        formatted_comments = []
-        for comment in comments:
-            formatted_comments.append({
-                'id': comment.get('id'),
-                'text': comment.get('text'),
-                'author': comment.get('author'),
-                'author_id': comment.get('author_id'),
-                'timestamp': comment.get('timestamp'),
-                'like_count': comment.get('like_count', 0),
-                'is_reply': bool(comment.get('parent') != 'root'),
-                'parent_id': comment.get('parent')
-            })
-        
-        import json
-        if video_record is None:
-            video_record = VideoRecord(
-                video_id=video_id,
-                url=url,
-                title=info.get('title', ''),
-                comments=json.dumps(formatted_comments)
-            )
-            session.add(video_record)
-        else:
-            video_record.comments = json.dumps(formatted_comments)
-        session.commit()
+            return get_comments_response  # Propagate the error response from get_comments
+        comments_data = get_comments_response.get_json()
+        formatted_comments = comments_data['comments']
+        total_comments = comments_data['total_comments']
     else:
         # Use cached comments
         import json

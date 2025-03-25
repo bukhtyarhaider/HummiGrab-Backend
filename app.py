@@ -176,111 +176,113 @@ def get_comments():
 
 @app.route('/analyze_sentiment', methods=['POST'])
 def analyze_sentiment():
-    data = request.get_json() or {}
-    url = data.get('url')
-    if not url:
-        logger.error("No URL provided for sentiment analysis")
-        return jsonify({'error': 'URL must be provided'}), 400
+    try:
+        data = request.get_json(silent=True)
+        if not data or 'url' not in data:
+            logger.error("Invalid or missing JSON data")
+            return jsonify({'error': 'Valid JSON with URL must be provided'}), 400
 
-    # Extract video ID from the URL
-    pattern = r'(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})'
-    match = re.search(pattern, url)
-    if not match:
-        logger.error("Invalid YouTube URL")
-        return jsonify({'error': 'Invalid YouTube URL'}), 400
-    video_id = match.group(1)
-    logger.info(f"Starting sentiment analysis for video_id: {video_id} from URL: {url}")
+        url = data.get('url', '').strip()
+        if not url:
+            logger.error("Empty URL provided")
+            return jsonify({'error': 'URL cannot be empty'}), 400
 
-    # Check if comments exist in the database
-    session = SessionLocal()
-    video_record = session.query(VideoRecord).filter(VideoRecord.video_id == video_id).first()
-    
-    if not video_record or not video_record.comments:
-        logger.info(f"No comments found for video_id: {video_id}, calling get_comments")
-        # Call get_comments to fetch and store comments
-        get_comments_response = get_comments()  # This reuses the existing request context
-        if get_comments_response.status_code != 200:
-            session.close()
-            return get_comments_response  # Propagate the error response from get_comments
-        comments_data = get_comments_response.get_json()
-        formatted_comments = comments_data['comments']
-        total_comments = comments_data['total_comments']
-    else:
-        # Use cached comments
-        import json
-        formatted_comments = json.loads(video_record.comments)
-        # Fetch total comments for consistency
-        ydl_opts = {'quiet': True, 'skip_download': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            total_comments = info.get('comment_count', len(formatted_comments))
-
-    session.close()
-
-    # Perform sentiment analysis
-    sentiment_results = []
-    positive_count = 0
-    negative_count = 0
-    neutral_count = 0
-
-    for comment in formatted_comments:
-        text = comment.get('text', '')
-        if not text:
-            continue
-        blob = TextBlob(text)
-        polarity = blob.sentiment.polarity  # Ranges from -1 (negative) to 1 (positive)
+        pattern = r'(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})'
+        match = re.search(pattern, url)
+        if not match:
+            logger.error(f"Invalid YouTube URL: {url}")
+            return jsonify({'error': 'Invalid YouTube URL'}), 400
         
-        # Classify sentiment
-        if polarity > 0.1:
-            sentiment = 'positive'
-            positive_count += 1
-        elif polarity < -0.1:
-            sentiment = 'negative'
-            negative_count += 1
-        else:
-            sentiment = 'neutral'
-            neutral_count += 1
+        video_id = match.group(1)
+        logger.info(f"Initiating sentiment analysis for video_id: {video_id}")
+
+        # Leverage existing get_comments endpoint
+        comments_response = get_comments()  # Call with current request context
+        if comments_response.status_code != 200:
+            return comments_response
         
-        sentiment_results.append({
-            'id': comment['id'],
-            'text': text,
-            'sentiment': sentiment,
-            'polarity': polarity
+        comments_data = comments_response.get_json()
+        formatted_comments = comments_data.get('comments', [])
+        total_comments = comments_data.get('total_comments', 0)
+
+        if not formatted_comments:
+            logger.info(f"No comments available for analysis for video_id: {video_id}")
+            return jsonify({
+                'video_id': video_id,
+                'error': 'No comments available for analysis'
+            }), 404
+
+        # Perform sentiment analysis
+        sentiment_results = []
+        sentiment_counts = {'positive': 0, 'negative': 0, 'neutral': 0}
+
+        for comment in formatted_comments:
+            text = comment.get('text', '').strip()
+            if not text or len(text) < 3:  # Skip very short comments
+                continue
+                
+            try:
+                blob = TextBlob(text)
+                polarity = blob.sentiment.polarity  # Ranges from -1 (negative) to 1 (positive)
+                subjectivity = blob.sentiment.subjectivity  # 0 to 1
+                
+                # Adjusted thresholds for consistency with TextBlob
+                if polarity > 0.2 and subjectivity > 0.3:
+                    sentiment = 'positive'
+                    sentiment_counts['positive'] += 1
+                elif polarity < -0.2 and subjectivity > 0.3:
+                    sentiment = 'negative'
+                    sentiment_counts['negative'] += 1
+                else:
+                    sentiment = 'neutral'
+                    sentiment_counts['neutral'] += 1
+                
+                sentiment_results.append({
+                    'id': comment.get('id', ''),
+                    'text': text,
+                    'sentiment': sentiment,
+                    'polarity': round(polarity, 3),
+                    'subjectivity': round(subjectivity, 3)
+                })
+            except Exception as e:
+                logger.warning(f"Sentiment analysis failed for comment {comment.get('id', 'unknown')}: {str(e)}")
+                continue
+
+        total_analyzed = sum(sentiment_counts.values())
+        if total_analyzed == 0:
+            logger.info(f"No valid comments analyzed for video_id: {video_id}")
+            return jsonify({
+                'video_id': video_id,
+                'error': 'No valid comments could be analyzed'
+            }), 404
+
+        # Calculate summary with rounded percentages
+        sentiment_summary = {
+            sentiment: {
+                'count': count,
+                'percentage': round((count / total_analyzed * 100), 2) if total_analyzed > 0 else 0
+            }
+            for sentiment, count in sentiment_counts.items()
+        }
+        sentiment_summary.update({
+            'total_analyzed': total_analyzed,
+            'total_comments': total_comments
         })
 
-    total_analyzed = positive_count + negative_count + neutral_count
-    if total_analyzed == 0:
-        logger.info(f"No valid comments to analyze for video_id: {video_id}")
+        logger.info(f"Sentiment analysis completed for video_id: {video_id} - "
+                   f"Positive: {sentiment_counts['positive']}, "
+                   f"Negative: {sentiment_counts['negative']}, "
+                   f"Neutral: {sentiment_counts['neutral']}")
+
         return jsonify({
-            'error': 'No valid comments to analyze',
-            'video_id': video_id
-        }), 404
+            'video_id': video_id,
+            'sentiment_results': sentiment_results,
+            'sentiment_summary': sentiment_summary
+        }), 200
 
-    # Calculate percentages
-    sentiment_summary = {
-        'positive': {
-            'count': positive_count,
-            'percentage': (positive_count / total_analyzed * 100) if total_analyzed > 0 else 0
-        },
-        'negative': {
-            'count': negative_count,
-            'percentage': (negative_count / total_analyzed * 100) if total_analyzed > 0 else 0
-        },
-        'neutral': {
-            'count': neutral_count,
-            'percentage': (neutral_count / total_analyzed * 100) if total_analyzed > 0 else 0
-        },
-        'total_analyzed': total_analyzed,
-        'total_comments': total_comments
-    }
-
-    logger.info(f"Sentiment analysis completed for video_id: {video_id} - Positive: {positive_count}, Negative: {negative_count}, Neutral: {neutral_count}")
-
-    return jsonify({
-        'video_id': video_id,
-        'sentiment_results': sentiment_results,
-        'sentiment_summary': sentiment_summary
-    })
+    except Exception as e:
+        logger.error(f"Unexpected error in sentiment analysis: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 # Updated /get_info endpoint returns video_id
 @app.route('/get_info', methods=['POST'])

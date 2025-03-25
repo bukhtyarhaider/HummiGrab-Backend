@@ -47,14 +47,15 @@ Base = declarative_base()
 class VideoRecord(Base):
     __tablename__ = 'video_records'
     id = Column(Integer, primary_key=True, index=True)
-    video_id = Column(String, unique=True, index=True)  
+    video_id = Column(String, unique=True, index=True)
     url = Column(String)
     title = Column(String)
     transcript = Column(Text)
     summary = Column(Text)
     filename = Column(String, nullable=True)
-    video_format = Column(String, nullable=True)   
-    file_size = Column(Integer, nullable=True)       
+    video_format = Column(String, nullable=True)
+    file_size = Column(Integer, nullable=True)
+    comments = Column(Text, nullable=True)  # comments (stored as JSON string)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
